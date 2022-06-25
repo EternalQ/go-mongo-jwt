@@ -2,13 +2,15 @@ package models
 
 import (
 	"context"
-	"crypto/sha1"
 	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt"
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var (
@@ -17,8 +19,8 @@ var (
 )
 
 type Tokens struct {
-	SigAccessToken  string
-	SigRefreshToken string
+	AccessTokenStr  string
+	RefreshTokenStr string
 }
 
 type TokenDoc struct {
@@ -27,67 +29,61 @@ type TokenDoc struct {
 }
 
 type Claims struct {
-	UserID  uuid.UUID
-	Login   string
-	RefHash string
-	IsExp   bool
+	UserID   uuid.UUID
+	Login    string
+	AccToken string
+	IsExp    bool
 }
 
-func encryptString(s string) string {
-	h := sha1.New()
-	h.Write([]byte(s))
-	bs := h.Sum(nil)
-	return fmt.Sprintf("%x", bs)
+func encryptString(s string) (string, error) {
+	bs, err := bcrypt.GenerateFromPassword([]byte(s), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+
+	return string(bs), nil
 }
 
 func generateTokens(u *UserDoc) (*Tokens, error) {
-	// &Claims{
-	// 	UserID: u.ID.String(),
-	// 	Login:  u.Login,
-	// 	StandardClaims: jwt.StandardClaims{
-	// 		ExpiresAt: time.Now().Add(100 * time.Second).Unix(),
-	// 	},
-	// }
-
 	claims := jwt.MapClaims{
 		"UserID": u.ID.String(),
 		"Login":  u.Login,
-		"exp":    time.Now().Add(72 * time.Hour).Unix(),
+		"exp":    time.Now().Add(10 * time.Minute).Unix(),
 	}
-
-	refreshToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(refreshSigningKey)
-	if err != nil {
-		return nil, err
-	}
-
-	refHash := encryptString(refreshToken)
-	claims["refHash"] = refHash
-	claims["exp"] = time.Now().Add(10 * time.Minute).Unix()
-
-	// fmt.Printf("ref: %v\nhsh: %v\n", refreshToken, refHash)
 
 	accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(accessSigningKey)
 	if err != nil {
 		return nil, err
 	}
 
+	claims["accToken"] = accessToken
+	claims["exp"] = time.Now().Add(72 * time.Hour).Unix()
+
+	refreshToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(refreshSigningKey)
+	if err != nil {
+		return nil, err
+	}
+
 	t := &Tokens{
-		SigAccessToken:  accessToken,
-		SigRefreshToken: refreshToken,
+		AccessTokenStr:  accessToken,
+		RefreshTokenStr: refreshToken,
 	}
 
 	return t, nil
 }
 
 func saveRefreshToken(token string, u *UserDoc, tokens *mongo.Collection) error {
-	hash := encryptString(token)
+	hash, err := encryptString(token)
+	if err != nil {
+		return err
+	}
 
 	t := &TokenDoc{
 		UserID:           u.ID,
 		RefreshTokenHash: hash,
 	}
 
-	if _, err := tokens.InsertOne(context.Background(), t); err != nil {
+	if _, err := tokens.UpdateOne(context.TODO(), bson.M{"user_id": u.ID}, bson.M{"$set": t}, options.Update().SetUpsert(true)); err != nil {
 		return err
 	}
 
@@ -100,7 +96,7 @@ func UpdateTokens(u *UserDoc, tokens *mongo.Collection) (*Tokens, error) {
 		return nil, err
 	}
 
-	if err = saveRefreshToken(tt.SigRefreshToken, u, tokens); err != nil {
+	if err = saveRefreshToken(tt.RefreshTokenStr, u, tokens); err != nil {
 		return nil, err
 	}
 
@@ -112,12 +108,11 @@ func getClaims(token *jwt.Token) (*Claims, error) {
 	var err error
 
 	claims, ok := token.Claims.(jwt.MapClaims)
-	// fmt.Printf("%v\n", token.Claims.Valid().Error())
 
 	if ok {
 		c.Login = claims["Login"].(string)
-		if claims["refHash"] != nil {
-			c.RefHash = claims["refHash"].(string)
+		if claims["accToken"] != nil {
+			c.AccToken = claims["accToken"].(string)
 		}
 		if c.UserID, err = uuid.Parse(claims["UserID"].(string)); err != nil {
 			return nil, err
@@ -155,17 +150,26 @@ func ValidateAccessToken(tokenStr string) (*Claims, error) {
 	return getClaims(token)
 }
 
-func ValidateRefreshToken(tokenStr, hash string) (*Claims, error) {
-	token, err := validateToken(tokenStr, refreshSigningKey)
+func ValidateRefreshToken(refToken, accToken, refFromDB string) (*Claims, error) {
+	token, err := validateToken(refToken, refreshSigningKey)
 	if err != nil {
 		return nil, err
 	}
 
-	newhash := encryptString(tokenStr)
-	// fmt.Printf("ref: %v\nold: %v\nnew: %v\n", tokenStr, hash, newhash)
-	if newhash != hash {
-		return nil, fmt.Errorf("wrong access token")
+	claims, err := getClaims(token)
+	if err != nil {
+		return nil, err
 	}
 
-	return getClaims(token)
+	if claims.AccToken != accToken {
+		return nil, fmt.Errorf("wrong access token")
+
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(refFromDB), []byte(refToken))
+	if err != nil {
+		return nil, err
+	}
+
+	return claims, nil
 }

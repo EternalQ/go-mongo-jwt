@@ -73,7 +73,7 @@ func handleSignIn(c *gin.Context) {
 		return
 	}
 
-	if err := users.FindOne(context.Background(), bson.D{{"_id", id}}).Decode(u); err != nil {
+	if err := users.FindOne(context.Background(), bson.M{"_id": id}).Decode(u); err != nil {
 		c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
@@ -84,9 +84,9 @@ func handleSignIn(c *gin.Context) {
 		return
 	}
 
-	c.SetCookie("reftoken", tt.SigRefreshToken, 72*60*60, "", "", false, true)
+	c.SetCookie("reftoken", tt.RefreshTokenStr, 72*60*60, "", "", false, true)
 
-	c.JSON(200, tt.SigAccessToken)
+	c.JSON(200, tt.AccessTokenStr)
 }
 
 func handleRefresh(c *gin.Context) {
@@ -103,26 +103,33 @@ func handleRefresh(c *gin.Context) {
 		return
 	}
 	if err != nil && err.Error() != "Token is expired" {
-		c.AbortWithError(http.StatusInternalServerError, err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 
-	// if expired validate refresh token...
+	// if expired validate refresh token
 	refreshToken, err := c.Cookie("reftoken")
 	if err != nil {
-		c.AbortWithError(http.StatusUnauthorized, err)
+		c.AbortWithStatusJSON(http.StatusUnauthorized, err)
 		return
 	}
 
-	refClaims, err := models.ValidateRefreshToken(refreshToken, accClaims.RefHash)
+	refTokenFromDB := &models.TokenDoc{}
+	if err := tokens.FindOne(context.Background(), bson.M{"user_id": accClaims.UserID}).Decode(refTokenFromDB); err != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, err)
+		return
+	}
+
+	// validation for expiration, token dependency and matching for db and cookie tokens
+	refClaims, err := models.ValidateRefreshToken(refreshToken, accessToken, refTokenFromDB.RefreshTokenHash)
 	if err != nil {
-		c.AbortWithError(http.StatusUnauthorized, err)
+		c.AbortWithStatusJSON(http.StatusUnauthorized, err)
 		return
 	}
 
-	// and generate new pair
-	if err := users.FindOne(context.Background(), bson.D{{"_id", refClaims.UserID}}).Decode(refClaims); err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
+	// if valid generate new pair
+	if err := users.FindOne(context.Background(), bson.M{"_id": refClaims.UserID}).Decode(refClaims); err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -132,11 +139,11 @@ func handleRefresh(c *gin.Context) {
 	}
 	tt, err := models.UpdateTokens(u, tokens)
 	if err != nil {
-		c.AbortWithError(http.StatusBadRequest, err)
+		c.AbortWithStatusJSON(http.StatusBadRequest, err)
 		return
 	}
 
-	c.SetCookie("reftoken", tt.SigRefreshToken, 72*60*60, "", "", false, true)
+	c.SetCookie("reftoken", tt.RefreshTokenStr, 72*60*60, "", "", false, true)
 
-	c.JSON(200, tt.SigAccessToken)
+	c.JSON(200, tt.AccessTokenStr)
 }
